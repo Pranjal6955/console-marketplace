@@ -2,7 +2,8 @@
   "format": "kc-card-preset-v1",
   "card_type": "notary_status",
   "title": "Notary",
-  "config": {},
-  "_placeholder": true,
-  "_help_wanted": "This card preset is a placeholder. See the associated GitHub issue for implementation instructions."
+  "description": "Notary container image signing status and trust policies.",
+  "category": "Security",
+  "defaultSize": { "w": 6, "h": 4 },
+  "config": {}
 }
