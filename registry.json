@@ -1868,8 +1868,8 @@
       "id": "cncf-thanos",
       "name": "Thanos Status",
       "description": "Global metrics view, store gateway health, and query status for Thanos clusters.",
-      "author": "kubestellar",
-      "authorGithub": "clubanderson",
+      "author": "Pranjal6955",
+      "authorGithub": "Pranjal6955",
       "version": "1.0.0",
       "downloadUrl": "https://raw.githubusercontent.com/kubestellar/console-marketplace/main/presets/cncf-thanos.json",
       "tags": [
