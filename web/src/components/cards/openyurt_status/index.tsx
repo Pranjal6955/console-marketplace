@@ -14,8 +14,17 @@ import {
 import { useTranslation } from 'react-i18next'
 import { Skeleton, SkeletonStats, SkeletonList } from '../../ui/Skeleton'
 import { CardSearchInput } from '../../../lib/cards/CardComponents'
+import { useCardLoadingState } from '../CardDataContext'
+import { useDemoMode } from '../../../hooks/useDemoMode'
+import { useGlobalFilters } from '../../../hooks/useGlobalFilters'
 import { useOpenYurtStatus } from './useOpenYurtStatus'
 import type { OpenYurtNodePool, NodePoolStatus, NodePoolType, OpenYurtGateway, GatewayStatus } from './demoData'
+
+interface OpenYurtStatusProps {
+  config?: {
+    cluster?: string
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -194,28 +203,77 @@ function GatewayRow({ gw }: { gw: OpenYurtGateway }) {
   )
 }
 
+function DemoBadge() {
+  const { t } = useTranslation('cards')
+  return (
+    <span
+      className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium uppercase tracking-wide bg-yellow-500/15 text-yellow-400 border border-yellow-500/30"
+      data-testid="openyurt-demo-badge"
+      title={t('openyurt.demoBadgeHint', 'Showing demo data — live backend unavailable')}
+    >
+      {t('openyurt.demoBadge', 'Demo')}
+    </span>
+  )
+}
+
 // ---------------------------------------------------------------------------
 // Main component
 // ---------------------------------------------------------------------------
 
-export function OpenYurtStatus() {
+export function OpenYurtStatus({ config }: OpenYurtStatusProps = {}) {
   const { t } = useTranslation('cards')
+  const { isDemoMode } = useDemoMode()
+  const { selectedClusters } = useGlobalFilters()
   const formatRelativeTime = useFormatRelativeTime()
-  const { data, isRefreshing, error, showSkeleton, showEmptyState } = useOpenYurtStatus()
+
+  // Resolve the cluster for cluster-scoped endpoints. Config wins, then the
+  // first globally-selected cluster, else undefined (single-cluster context).
+  const cluster = config?.cluster ?? selectedClusters?.[0]
+
+  const {
+    data,
+    isLoading,
+    isRefreshing,
+    isFailed,
+    isDemoFallback,
+    consecutiveFailures,
+    lastRefresh,
+  } = useOpenYurtStatus(cluster)
+
   const [search, setSearch] = useState('')
 
   const nodePools = data.nodePools || []
   const gateways = data.gateways || []
   const controllerPods = data.controllerPods || { ready: 0, total: 0 }
+  const fetchError = data.fetchError ?? null
 
-  const stats = (() => {
-    return {
-      totalPools: nodePools.length,
-      readyPools: nodePools.filter(p => p.status === 'ready').length,
-      edgePools: nodePools.filter(p => p.type === 'edge').length,
-      connectedGateways: gateways.filter(g => g.status === 'connected').length,
-    }
-  })()
+  // isDemoData is true whenever we're showing demo-sourced data — either the
+  // user flipped demo mode explicitly, or the live fetcher failed/returned
+  // nothing and useCache fell back to OPENYURT_DEMO_DATA. Mirrors the
+  // pattern from Resource Quota / Ingress (PRs #9356, #9357).
+  const isDemoData = isDemoMode || isDemoFallback
+
+  const hasAnyData =
+    nodePools.length > 0 ||
+    gateways.length > 0 ||
+    controllerPods.total > 0
+
+  const { showSkeleton, showEmptyState } = useCardLoadingState({
+    isLoading,
+    isRefreshing,
+    hasAnyData,
+    isFailed,
+    consecutiveFailures,
+    isDemoData,
+    lastRefresh,
+  })
+
+  const stats = {
+    totalPools: nodePools.length,
+    readyPools: nodePools.filter(p => p.status === 'ready').length,
+    edgePools: nodePools.filter(p => p.type === 'edge').length,
+    connectedGateways: gateways.filter(g => g.status === 'connected').length,
+  }
 
   const filteredPools = (() => {
     if (!search.trim()) return nodePools
@@ -228,9 +286,10 @@ export function OpenYurtStatus() {
     )
   })()
 
+  // ── Loading ──────────────────────────────────────────────────────────────
   if (showSkeleton) {
     return (
-      <div className="h-full flex flex-col min-h-card gap-4">
+      <div className="h-full flex flex-col min-h-card gap-4" data-testid="openyurt-skeleton">
         <div className="flex items-center justify-between">
           <Skeleton variant="rounded" width={120} height={28} />
           <Skeleton variant="rounded" width={80} height={20} />
@@ -242,18 +301,32 @@ export function OpenYurtStatus() {
     )
   }
 
-  if (error && showEmptyState) {
+  // ── Hard error with no cached data: render a scoped error message ────────
+  if (showEmptyState && isFailed && !hasAnyData && !isDemoData) {
+    const msg = fetchError
+      ? t(`openyurt.fetchError_${fetchError.resource}`, {
+          defaultValue:
+            fetchError.resource === 'nodepools'
+              ? 'Failed to list nodepools.apps.openyurt.io — check RBAC.'
+              : fetchError.resource === 'gateways'
+                ? 'Failed to list gateways.raven.openyurt.io — check RBAC.'
+                : 'Failed to fetch OpenYurt pods.',
+          message: fetchError.message,
+        })
+      : t('openyurt.fetchError', 'Failed to fetch OpenYurt status')
     return (
-      <div className="h-full flex flex-col items-center justify-center min-h-card text-muted-foreground gap-2">
+      <div
+        className="h-full flex flex-col items-center justify-center min-h-card text-muted-foreground gap-2"
+        data-testid="openyurt-error"
+      >
         <AlertTriangle className="w-6 h-6 text-red-400" />
-        <p className="text-sm text-red-400">
-          {t('openyurt.fetchError', 'Failed to fetch OpenYurt status')}
-        </p>
+        <p className="text-sm text-red-400 text-center max-w-xs">{msg}</p>
       </div>
     )
   }
 
-  if (data.health === 'not-installed') {
+  // ── Not installed ─────────────────────────────────────────────────────────
+  if (data.health === 'not-installed' && !isDemoData) {
     return (
       <div className="h-full flex flex-col items-center justify-center min-h-card text-muted-foreground gap-2">
         <Radio className="w-6 h-6 text-muted-foreground/50" />
@@ -275,8 +348,18 @@ export function OpenYurtStatus() {
     ? 'bg-green-500/15 text-green-400'
     : 'bg-yellow-500/15 text-yellow-400'
 
+  // Demo fallback gives a yellow outline so the user can visually distinguish
+  // demo data from live data at a glance.
+  const rootOutlineClass = isDemoData
+    ? 'ring-1 ring-yellow-500/30 rounded-lg'
+    : ''
+
   return (
-    <div className="h-full flex flex-col min-h-card content-loaded gap-4 overflow-hidden">
+    <div
+      className={`h-full flex flex-col min-h-card content-loaded gap-4 overflow-hidden ${rootOutlineClass}`}
+      data-testid="openyurt-card"
+    >
+      {/* ── Header: health badge + controller pods + demo badge + last check ── */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <div
@@ -296,12 +379,34 @@ export function OpenYurtStatus() {
             {controllerPods.ready}/{controllerPods.total}{' '}
             {t('openyurt.controllerPods', 'pods')}
           </span>
+          {isDemoData && <DemoBadge />}
         </div>
         <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
           <RefreshCw className={`w-3 h-3 ${isRefreshing ? 'animate-spin' : ''}`} />
           <span>{formatRelativeTime(data.lastCheckTime)}</span>
         </div>
       </div>
+
+      {/* Soft-error banner when we fell back to demo but one sub-fetch
+          still failed — lets the user know which RBAC is missing. */}
+      {!isDemoMode && fetchError && (
+        <div className="text-[11px] px-2 py-1 rounded-md bg-red-500/10 text-red-300 border border-red-500/20">
+          {fetchError.resource === 'nodepools' &&
+            t('openyurt.fetchError_nodepools', {
+              defaultValue:
+                'Failed to list nodepools.apps.openyurt.io — check RBAC.',
+            })}
+          {fetchError.resource === 'gateways' &&
+            t('openyurt.fetchError_gateways', {
+              defaultValue:
+                'Failed to list gateways.raven.openyurt.io — check RBAC.',
+            })}
+          {fetchError.resource === 'pods' &&
+            t('openyurt.fetchError_pods', {
+              defaultValue: 'Failed to fetch OpenYurt pods.',
+            })}
+        </div>
+      )}
 
       {nodePools.length > 0 && (
         <div className="grid grid-cols-4 gap-2">

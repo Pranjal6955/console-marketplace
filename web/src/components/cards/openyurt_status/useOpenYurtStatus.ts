@@ -1,5 +1,4 @@
 import { useCache } from '../../../lib/cache'
-import { useCardLoadingState } from '../CardDataContext'
 import { OPENYURT_DEMO_DATA, type OpenYurtDemoData, type OpenYurtNodePool, type NodePoolType, type NodePoolStatus, type GatewayStatus } from './demoData'
 import { FETCH_DEFAULT_TIMEOUT_MS } from '../../../lib/constants'
 import { authFetch } from '../../../lib/api'
@@ -14,6 +13,7 @@ const INITIAL_DATA: OpenYurtStatus = {
   totalNodes: 0,
   autonomousNodes: 0,
   lastCheckTime: new Date().toISOString(),
+  fetchError: null,
 }
 
 const CACHE_KEY = 'openyurt-status'
@@ -43,6 +43,20 @@ interface CRItem {
 interface CRResponse {
   items?: CRItem[]
   isDemoData?: boolean
+}
+
+// Error surfacing: track which resource failed so the UI can tell the user
+// specifically whether nodepools or gateways is the problem (e.g. missing
+// RBAC on nodepools.apps.openyurt.io vs. gateways.raven.openyurt.io).
+export interface OpenYurtFetchError {
+  resource: 'pods' | 'nodepools' | 'gateways'
+  message: string
+}
+
+function appendClusterParam(path: string, cluster?: string): string {
+  if (!cluster) return path
+  const sep = path.includes('?') ? '&' : '?'
+  return `${path}${sep}cluster=${encodeURIComponent(cluster)}`
 }
 
 // ---------------------------------------------------------------------------
@@ -77,19 +91,29 @@ function isPodReady(pod: BackendPodInfo): boolean {
 // CRD helpers
 // ---------------------------------------------------------------------------
 
-async function fetchCR(group: string, version: string, resource: string): Promise<CRItem[]> {
-  try {
-    const params = new URLSearchParams({ group, version, resource })
-    const resp = await authFetch(`/api/mcp/custom-resources?${params}`, {
-      headers: { Accept: 'application/json' },
-      signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS),
-    })
-    if (!resp.ok) return []
-    const body: CRResponse = await resp.json()
-    return body.items ?? []
-  } catch {
-    return []
+class CRFetchError extends Error {
+  constructor(public resource: 'nodepools' | 'gateways', message: string) {
+    super(message)
   }
+}
+
+async function fetchCR(
+  group: string,
+  version: string,
+  resource: 'nodepools' | 'gateways',
+  cluster?: string,
+): Promise<CRItem[]> {
+  const params = new URLSearchParams({ group, version, resource })
+  const path = appendClusterParam(`/api/mcp/custom-resources?${params}`, cluster)
+  const resp = await authFetch(path, {
+    headers: { Accept: 'application/json' },
+    signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS),
+  })
+  if (!resp.ok) {
+    throw new CRFetchError(resource, `HTTP ${resp.status} ${resp.statusText}`)
+  }
+  const body: CRResponse = await resp.json()
+  return body.items ?? []
 }
 
 // ---------------------------------------------------------------------------
@@ -103,11 +127,9 @@ function parseNodePool(item: CRItem): OpenYurtNodePool {
   const status = (item.status ?? {}) as Record<string, unknown>
   const annotations = item.annotations ?? {}
 
-  // Pool type: spec.type or annotation
   const rawType = (spec.type as string) ?? annotations['apps.openyurt.io/pool-type'] ?? 'edge'
   const poolType: NodePoolType = KNOWN_POOL_TYPES.has(rawType) ? (rawType as NodePoolType) : 'edge'
 
-  // Node counts from status
   const nodeCount = typeof status.readyNodeNum === 'number' && typeof status.unreadyNodeNum === 'number'
     ? status.readyNodeNum + status.unreadyNodeNum
     : typeof status.nodes === 'number'
@@ -117,7 +139,6 @@ function parseNodePool(item: CRItem): OpenYurtNodePool {
     ? status.readyNodeNum
     : nodeCount
 
-  // Derive pool status
   let poolStatus: NodePoolStatus = 'ready'
   if (nodeCount === 0 || readyNodes === 0) {
     poolStatus = 'not-ready'
@@ -125,7 +146,6 @@ function parseNodePool(item: CRItem): OpenYurtNodePool {
     poolStatus = 'degraded'
   }
 
-  // Autonomy enabled check
   const autonomyEnabled = poolType === 'edge' ||
     spec.autonomy === true ||
     annotations['node.beta.openyurt.io/autonomy'] === 'true'
@@ -152,13 +172,11 @@ function parseGateway(item: CRItem): { name: string; nodePool: string; status: G
     (spec.proxyNodePool as string) ??
     (item.labels?.['raven.openyurt.io/gateway-node-pool'] ?? '')
 
-  // Derive endpoint
   const endpoints = Array.isArray(spec.endpoints) ? spec.endpoints : []
   const endpoint = endpoints.length > 0
     ? ((endpoints[0] as Record<string, unknown>).publicIP as string) ?? ''
     : (spec.endpoint as string) ?? ''
 
-  // Derive status
   const activeEndpoints = Array.isArray(status.activeEndpoints) ? status.activeEndpoints : []
   const nodes = Array.isArray(status.nodes) ? status.nodes : []
   let gwStatus: GatewayStatus = 'pending'
@@ -185,7 +203,7 @@ async function fetchPods(url: string): Promise<BackendPodInfo[]> {
     headers: { Accept: 'application/json' },
     signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS),
   })
-  if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+  if (!resp.ok) throw new Error(`HTTP ${resp.status} ${resp.statusText}`)
   const body: { pods?: BackendPodInfo[] } = await resp.json()
   return Array.isArray(body?.pods) ? body.pods : []
 }
@@ -194,14 +212,29 @@ async function fetchPods(url: string): Promise<BackendPodInfo[]> {
 // Main fetcher
 // ---------------------------------------------------------------------------
 
-async function fetchOpenYurtStatus(): Promise<OpenYurtStatus> {
-  // Step 1: Detect OpenYurt controller pods
-  const labeledPods = await fetchPods(
-    '/api/mcp/pods?labelSelector=app.kubernetes.io%2Fname%3Dyurt-manager',
-  )
-  const yurtPods = labeledPods.length > 0
-    ? labeledPods.filter(isOpenYurtControllerPod)
-    : (await fetchPods('/api/mcp/pods')).filter(isOpenYurtControllerPod)
+async function fetchOpenYurtStatus(cluster?: string): Promise<OpenYurtStatus> {
+  // Step 1: Detect OpenYurt controller pods.
+  let yurtPods: BackendPodInfo[]
+  try {
+    const labeledPath = appendClusterParam(
+      '/api/mcp/pods?labelSelector=app.kubernetes.io%2Fname%3Dyurt-manager',
+      cluster,
+    )
+    const labeledPods = await fetchPods(labeledPath)
+    yurtPods = labeledPods.length > 0
+      ? labeledPods.filter(isOpenYurtControllerPod)
+      : (await fetchPods(appendClusterParam('/api/mcp/pods', cluster))).filter(isOpenYurtControllerPod)
+  } catch (e) {
+    return {
+      ...INITIAL_DATA,
+      health: 'not-installed',
+      lastCheckTime: new Date().toISOString(),
+      fetchError: {
+        resource: 'pods',
+        message: e instanceof Error ? e.message : String(e),
+      },
+    }
+  }
 
   if (yurtPods.length === 0) {
     return {
@@ -214,16 +247,35 @@ async function fetchOpenYurtStatus(): Promise<OpenYurtStatus> {
   const readyPods = yurtPods.filter(isPodReady).length
   const allPodsReady = readyPods === yurtPods.length
 
-  // Step 2: Fetch NodePool and Gateway CRDs (best-effort, in parallel)
-  const [nodePoolItems, gatewayItems] = await Promise.all([
-    fetchCR('apps.openyurt.io', 'v1beta1', 'nodepools'),
-    fetchCR('raven.openyurt.io', 'v1beta1', 'gateways'),
+  // Step 2: Fetch NodePool and Gateway CRDs independently so a single RBAC
+  // gap (e.g. user lacks list on nodepools.apps.openyurt.io) surfaces a
+  // specific error rather than hiding both sides behind a generic failure.
+  const [nodePoolResult, gatewayResult] = await Promise.allSettled([
+    fetchCR('apps.openyurt.io', 'v1beta1', 'nodepools', cluster),
+    fetchCR('raven.openyurt.io', 'v1beta1', 'gateways', cluster),
   ])
+
+  let fetchError: OpenYurtFetchError | null = null
+  const nodePoolItems = nodePoolResult.status === 'fulfilled' ? nodePoolResult.value : []
+  const gatewayItems = gatewayResult.status === 'fulfilled' ? gatewayResult.value : []
+
+  if (nodePoolResult.status === 'rejected') {
+    const err = nodePoolResult.reason
+    fetchError = {
+      resource: 'nodepools',
+      message: err instanceof Error ? err.message : String(err),
+    }
+  } else if (gatewayResult.status === 'rejected') {
+    const err = gatewayResult.reason
+    fetchError = {
+      resource: 'gateways',
+      message: err instanceof Error ? err.message : String(err),
+    }
+  }
 
   const nodePools = nodePoolItems.map(parseNodePool)
   const gateways = gatewayItems.map(parseGateway)
 
-  // Compute aggregates
   const totalNodes = nodePools.reduce((sum, np) => sum + np.nodeCount, 0)
   const autonomousNodes = nodePools
     .filter(np => np.autonomyEnabled)
@@ -240,6 +292,7 @@ async function fetchOpenYurtStatus(): Promise<OpenYurtStatus> {
     totalNodes,
     autonomousNodes,
     lastCheckTime: new Date().toISOString(),
+    fetchError,
   }
 }
 
@@ -249,51 +302,43 @@ async function fetchOpenYurtStatus(): Promise<OpenYurtStatus> {
 
 export interface UseOpenYurtStatusResult {
   data: OpenYurtStatus
-  loading: boolean
+  isLoading: boolean
   isRefreshing: boolean
-  error: boolean
+  isFailed: boolean
+  isDemoFallback: boolean
   consecutiveFailures: number
-  showSkeleton: boolean
-  showEmptyState: boolean
+  lastRefresh: number | null
+  refetch: () => Promise<void>
 }
 
-export function useOpenYurtStatus(): UseOpenYurtStatusResult {
+export function useOpenYurtStatus(cluster?: string): UseOpenYurtStatusResult {
   const {
     data,
     isLoading,
     isRefreshing,
     isFailed,
-    consecutiveFailures,
     isDemoFallback,
-  } = useCache<OpenYurtStatus>({
-    key: CACHE_KEY,
-    category: 'default',
-    initialData: INITIAL_DATA,
-    demoData: OPENYURT_DEMO_DATA,
-    persist: true,
-    fetcher: fetchOpenYurtStatus,
-  })
-
-  const effectiveIsDemoData = isDemoFallback && !isLoading
-
-  const hasData = (data.nodePools?.length ?? 0) > 0 || (data.gateways?.length ?? 0) > 0
-  const hasAnyData = hasData || (data.controllerPods?.total ?? 0) > 0
-
-  const { showSkeleton, showEmptyState } = useCardLoadingState({
-    isLoading: isLoading && !hasData,
-    hasAnyData,
-    isFailed,
     consecutiveFailures,
-    isDemoData: effectiveIsDemoData,
+    lastRefresh,
+    refetch,
+  } = useCache<OpenYurtStatus>({
+    key: cluster ? `${CACHE_KEY}:${cluster}` : CACHE_KEY,
+    fetcher: () => fetchOpenYurtStatus(cluster),
+    demoData: OPENYURT_DEMO_DATA,
+    initialData: INITIAL_DATA,
+    category: 'default',
+    persist: true,
+    demoWhenEmpty: true,
   })
 
   return {
     data,
-    loading: isLoading,
+    isLoading,
     isRefreshing,
-    error: isFailed && !hasAnyData,
+    isFailed,
+    isDemoFallback,
     consecutiveFailures,
-    showSkeleton,
-    showEmptyState,
+    lastRefresh,
+    refetch,
   }
 }

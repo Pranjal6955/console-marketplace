@@ -40,6 +40,14 @@ export interface OpenYurtGateway {
   endpoint: string
 }
 
+export interface OpenYurtFetchErrorInfo {
+  /** Which sub-resource failed to fetch — lets the card surface a
+   *  specific reason (e.g. RBAC gap on nodepools) instead of a generic
+   *  fetch error. */
+  resource: 'pods' | 'nodepools' | 'gateways'
+  message: string
+}
+
 export interface OpenYurtDemoData {
   health: 'healthy' | 'degraded' | 'not-installed'
   controllerPods: {
@@ -51,6 +59,7 @@ export interface OpenYurtDemoData {
   totalNodes: number
   autonomousNodes: number
   lastCheckTime: string
+  fetchError?: OpenYurtFetchErrorInfo | null
 }
 
 export const OPENYURT_DEMO_DATA: OpenYurtDemoData = {
@@ -127,4 +136,5 @@ export const OPENYURT_DEMO_DATA: OpenYurtDemoData = {
   totalNodes: 20,
   autonomousNodes: 17,
   lastCheckTime: new Date(Date.now() - DEMO_LAST_CHECK_OFFSET_MS).toISOString(),
+  fetchError: null,
 }
